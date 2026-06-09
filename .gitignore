@@ -25,3 +25,10 @@ venv/
 # OS
 Thumbs.db
 .DS_Store
+
+# Generated CA bundle (created by install_nuc_cert.py)
+ca_bundle.pem
+
+# Temporary certificate files
+*.crt
+*.pem
