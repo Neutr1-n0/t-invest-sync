@@ -2,8 +2,8 @@ name: T-Invest sync
 
 on:
   schedule:
-    # Каждый день в 06:00 UTC (09:00 МСК)
-    - cron: "0 6 * * *"
+    # Каждую неделю понедельник в 06:00 UTC (09:00 МСК)
+    - cron: "0 6 * * 1"
   workflow_dispatch: {}  # ручной запуск из вкладки Actions
 
 jobs:

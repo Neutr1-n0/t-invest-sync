@@ -29,6 +29,44 @@ pip install -r requirements.txt
 python sync.py --from 2020-01-01
 ```
 
+## Запуск через Docker (без venv)
+
+Тот же скрипт можно запустить в контейнере — не нужно ставить
+Python-зависимости локально, сертификат НУЦ Минцифры собирается
+автоматически на этапе сборки образа (см. `docker/build_ca_bundle.py`).
+
+1. Скопируйте `.env.example` в `.env` и заполните переменные (как в шаге 1
+   выше).
+2. Положите `credentials.json` (service account) в корень проекта.
+3. Соберите образ и запустите:
+
+```bash
+docker build -t tinvest-sync .
+
+docker run --rm \
+  --env-file .env \
+  -v "$(pwd)/credentials.json:/app/credentials.json:ro" \
+  tinvest-sync --from-last
+```
+
+На Windows (PowerShell) путь монтирования пишется так:
+
+```powershell
+docker run --rm `
+  --env-file .env `
+  -v "${PWD}/credentials.json:/app/credentials.json:ro" `
+  tinvest-sync --from-last
+```
+
+По умолчанию контейнер выполняет `--from-last`; чтобы передать другие
+флаги (`--from 2020-01-01`, `--insecure`), просто укажите их вместо
+`--from-last` в конце команды `docker run`.
+
+Этот же `Dockerfile` используется в `.github/workflows/sync.yml` для
+автоматического ежедневного запуска через GitHub Actions — там
+переменные приходят не из `.env`, а из GitHub Secrets, но сам образ
+и точка входа одинаковы для обоих случаев.
+
 ## Проблема с SSL-сертификатом
 
 API Т-Инвестиций использует сертификат, выпущенный **НУЦ Минцифры**
