@@ -1,0 +1,40 @@
+name: T-Invest sync
+
+on:
+  schedule:
+    # Каждый день в 06:00 UTC (09:00 МСК)
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}  # ручной запуск из вкладки Actions
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write Google service account credentials
+        run: echo "$GOOGLE_CREDENTIALS_JSON" > credentials.json
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+
+      - name: Build image
+        run: docker build -t tinvest-sync .
+
+      - name: Run sync
+        run: |
+          docker run --rm \
+            -e TINVEST_TOKEN="$TINVEST_TOKEN" \
+            -e GOOGLE_SPREADSHEET_ID="$GOOGLE_SPREADSHEET_ID" \
+            -e GOOGLE_SERVICE_ACCOUNT_FILE=/app/credentials.json \
+            -v "$PWD/credentials.json:/app/credentials.json:ro" \
+            tinvest-sync --from-last
+        env:
+          TINVEST_TOKEN: ${{ secrets.TINVEST_TOKEN }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+
+      - name: Clean up credentials file
+        if: always()
+        run: rm -f credentials.json
