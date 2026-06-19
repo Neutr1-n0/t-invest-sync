@@ -29,6 +29,100 @@ pip install -r requirements.txt
 python sync.py --from 2020-01-01
 ```
 
+## Настройка Google Sheets — пошагово
+
+Скрипт не входит в ваш Google-аккаунт как человек. Он работает от
+имени сервисного аккаунта («робот»). Нужно: создать этого робота в
+Console Google Cloud, скачать его ключ (`credentials.json`) и дать
+ему доступ к таблице (этот шаг часто пропускают).
+
+### Шаг 0. Что подготовить
+
+- Аккаунт Google (Gmail)
+- Браузер, желательно Chrome
+- Пустая или новая Google таблица (можно создать позже)
+
+### Шаг 1. Google Cloud Console и проект
+
+1. Откройте https://console.cloud.google.com/ и войдите в Google-аккаунт.
+2. Вверху слева — выпадающий список проектов → «Новый проект» (New Project).
+3. Имя, например: `t-invest-sync`. Нажмите «Создать» и дождитесь (10–30 сек).
+4. Убедитесь, что в шапке выбран именно этот проект.
+
+Google может попросить принять условия или привязать платёжный аккаунт.
+Для Google Sheets API в обычном использовании плата не взимается, но
+формально billing иногда всё равно просят.
+
+### Шаг 2. Включить Google Sheets API
+
+1. В меню слева: «APIs & Services» → «Library»
+   (или https://console.cloud.google.com/apis/library).
+2. В поиске: `Google Sheets API`.
+3. Откройте Google Sheets API и нажмите «Enable» / «Включить».
+
+### Шаг 3. Service Account (сервисный аккаунт)
+
+1. «APIs & Services» → «Credentials»
+   (или https://console.cloud.google.com/apis/credentials).
+2. Вверху: «+ CREATE CREDENTIALS» → «Service account».
+3. Заполните:
+   - Service account name: `t-invest-sync-bot`
+   - Service account ID — подставится сам
+4. «Create and Continue».
+5. Grant access (роль) — можно пропустить → «Continue» → «Done».
+
+### Шаг 4. Скачать JSON-ключ
+
+1. На странице Credentials в блоке «Service Accounts» кликните по
+   созданному аккаунту (`t-invest-sync-bot@...`).
+2. Вкладка «Keys» (Ключи) → «Add key» → «Create new key».
+3. Тип: JSON → «Create». Файл скачается автоматически.
+4. Переименуйте файл и положите в корень проекта как `credentials.json`.
+
+В `.env` это соответствует переменной `GOOGLE_SERVICE_ACCOUNT_FILE=credentials.json`
+(значение уже стоит по умолчанию в `.env.example`). Файл в `.gitignore`
+— в репозиторий не попадёт.
+
+### Шаг 5. Email робота — обязательно
+
+Откройте `credentials.json` и найдите поле `client_email`:
+
+```
+"client_email": "t-invest-sync-bot@ваш-проект.iam.gserviceaccount.com"
+```
+
+Скопируйте этот email — он понадобится для доступа к таблице.
+
+### Шаг 6. Google таблица и доступ
+
+1. Создайте таблицу: https://sheets.google.com → Пустая таблица.
+2. Откройте «Настройки доступа» / Share.
+3. Вставьте `client_email` из JSON, роль — Редактор (Editor).
+4. Снимите галочку «Уведомить», если мешает → «Готово».
+
+Без этого шага будет ошибка «The caller does not have permission».
+
+### Шаг 7. ID таблицы в .env
+
+ID — длинная строка в URL таблицы между `/d/` и `/edit`:
+
+```
+https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/edit
+
+GOOGLE_SPREADSHEET_ID=1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890
+```
+
+### Частые затруднения
+
+| Проблема | Решение |
+|---|---|
+| Не вижу «Service account» | Credentials → Create credentials → Service account (не «API key», не «OAuth») |
+| Скачался не JSON | При создании ключа выберите именно JSON |
+| «Permission denied» при запуске | Расшарьте таблицу на `client_email`, роль Editor |
+| «API has not been used» | Включите Google Sheets API в Library для того же проекта, где создан service account |
+| Просят billing | Создайте billing account — для Sheets при личном использовании обычно $0 |
+| Путаница OAuth vs Service Account | Нужен Service Account + JSON, не «OAuth client ID» |
+
 ## Запуск через Docker (без venv)
 
 Тот же скрипт можно запустить в контейнере — не нужно ставить
