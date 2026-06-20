@@ -1,6 +1,10 @@
 # t-invest-sync
 
+![version](https://img.shields.io/badge/version-1.0.0-blue)
+
 Синхронизация операций из брокера **Т-Инвестиции** в **Google Таблицу** (журнал сделок).
+
+[Changelog](CHANGELOG.md)
 
 ## Возможности
 
