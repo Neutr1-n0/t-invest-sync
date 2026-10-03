@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from tinvest_sync.api import TInvestClient
+from tinvest_sync.api import Account, TInvestClient
 from tinvest_sync.config import Settings
 from tinvest_sync.sheets import SheetsClient
 
@@ -28,6 +28,12 @@ def parse_from_date(value: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _is_syncable_invest_account(account: Account) -> bool:
+    return account.status == "ACCOUNT_STATUS_OPEN" and account.type in (
+        "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_TYPE_TINKOFF_IIS",
+    )
+
+
 def sync_operations(
     settings: Settings,
     date_from: datetime | None = None,
@@ -37,14 +43,12 @@ def sync_operations(
     sheets = SheetsClient(settings.spreadsheet_id, settings.service_account_file)
 
     # Fetch every eligible portfolio before ensure_sheet, which may write headers.
-    # Operations and account snapshots still include every returned account status.
+    # The account snapshot includes every status; data fetches use eligible accounts.
     accounts = client.get_accounts()
+    eligible_accounts = [account for account in accounts if _is_syncable_invest_account(account)]
     positions = []
-    for account in accounts:
-        if account.status == "ACCOUNT_STATUS_OPEN" and account.type in (
-            "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_TYPE_TINKOFF_IIS",
-        ):
-            positions.extend(client.get_portfolio(account))
+    for account in eligible_accounts:
+        positions.extend(client.get_portfolio(account))
     sheets.ensure_sheet()
 
     last_dates: dict[str, datetime] = {}
@@ -59,7 +63,7 @@ def sync_operations(
     skipped = 0
     new_operations = []
 
-    for account in accounts:
+    for account in eligible_accounts:
         account_date_from = date_from
         if account.id in last_dates:
             account_date_from = last_dates[account.id] - timedelta(days=1)

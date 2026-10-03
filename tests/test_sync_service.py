@@ -12,8 +12,8 @@ from tinvest_sync.sync_service import SyncResult, sync_operations
 
 
 FROM = datetime(2024, 1, 1, tzinfo=timezone.utc)
-A = Account("a", "Broker", "broker")
-B = Account("b", "IIS", "iis")
+A = Account("a", "Broker", "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_STATUS_OPEN")
+B = Account("b", "IIS", "ACCOUNT_TYPE_TINKOFF_IIS", "ACCOUNT_STATUS_OPEN")
 
 
 def operation(identifier, account=A):
@@ -149,34 +149,34 @@ def test_default_start_date(clients):
     sheets.get_last_operation_dates_by_account.assert_not_called()
 
 
-@pytest.mark.parametrize("other_status", ["ACCOUNT_STATUS_CLOSED", "ACCOUNT_STATUS_NEW"])
-def test_sync_processes_other_statuses_the_same_as_open(clients, other_status):
+@pytest.mark.parametrize("closed_has_watermark", [False, True])
+def test_from_last_skips_closed_account_and_preserves_existing_operations(clients, closed_has_watermark):
     settings, api, sheets, _, _ = clients
-    opened = Account("open", "Broker", "broker", status="ACCOUNT_STATUS_OPEN")
-    other = Account("other", "Other", "broker", status=other_status)
-    api.get_accounts.return_value = [opened, other]
-    operations = [operation("open-operation", opened), operation("other-operation", other)]
-    api.iter_operations.side_effect = [iter([operations[0]]), iter([operations[1]])]
+    closed = Account("closed", "Closed IIS", "ACCOUNT_TYPE_TINKOFF_IIS", "ACCOUNT_STATUS_CLOSED")
+    accounts = [A, closed, B]
+    api.get_accounts.return_value = accounts
+    last_date = datetime(2024, 2, 3, tzinfo=timezone.utc)
+    sheets.get_last_operation_dates_by_account.return_value = {A.id: last_date}
+    if closed_has_watermark:
+        sheets.get_last_operation_dates_by_account.return_value[closed.id] = last_date
+    sheets.get_existing_operation_ids.return_value = {"closed-history", "existing-open"}
+    new = operation("new", B)
+    api.iter_operations.side_effect = lambda account, date_from: iter(
+        [operation("existing-open", A)] if account == A else [new]
+    )
 
-    assert sync_operations(settings, date_from=FROM) == SyncResult(2, 2, 2, 0)
-    assert [call.args for call in api.iter_operations.call_args_list] == [
-        (opened, FROM), (other, FROM),
+    assert sync_operations(settings, use_last_sheet_date=True) == SyncResult(3, 2, 1, 1)
+    sheets.get_last_operation_dates_by_account.assert_called_once_with()
+    assert api.get_portfolio.call_args_list == [call(A), call(B)]
+    assert api.iter_operations.call_args_list == [
+        call(A, datetime(2024, 2, 2, tzinfo=timezone.utc)),
+        call(B, datetime(2019, 1, 1, tzinfo=timezone.utc)),
     ]
-    sheets.append_operations.assert_called_once_with(operations)
-
-
-def test_new_account_api_error_still_aborts_sync_without_append(clients):
-    settings, api, sheets, _, _ = clients
-    api.get_accounts.return_value = [
-        Account("open", "Broker", "broker", status="ACCOUNT_STATUS_OPEN"),
-        Account("new", "New", "broker", status="ACCOUNT_STATUS_NEW"),
+    assert sheets.method_calls == [
+        call.ensure_sheet(), call.get_last_operation_dates_by_account(),
+        call.get_existing_operation_ids(), call.append_operations([new]),
+        call.replace_accounts(accounts), call.replace_positions([], accounts),
     ]
-    api.iter_operations.side_effect = [iter([operation("one")]), TInvestAPIError("account unavailable")]
-    with pytest.raises(TInvestAPIError, match="account unavailable"):
-        sync_operations(settings, date_from=FROM)
-    assert api.iter_operations.call_count == 2
-    sheets.append_operations.assert_not_called()
-    sheets.replace_accounts.assert_not_called()
 
 
 def test_snapshot_failure_propagates_after_operations_append(clients):
@@ -220,6 +220,7 @@ def test_open_portfolios_form_one_snapshot_before_sheet_writes(clients, count):
 
     assert sync_operations(settings, date_from=FROM) == SyncResult(count, 0, 0, 0)
     assert api.get_portfolio.call_args_list == [call(account) for account in accounts]
+    assert api.iter_operations.call_args_list == [call(account, FROM) for account in accounts]
     sheets.replace_positions.assert_called_once_with([position(a) for a in accounts], accounts)
     assert timeline.method_calls[:count + 2] == [
         call.api.get_accounts(), *[call.api.get_portfolio(a) for a in accounts],
@@ -233,6 +234,7 @@ def test_open_portfolios_form_one_snapshot_before_sheet_writes(clients, count):
 
 @pytest.mark.parametrize("status,account_type", [
     ("ACCOUNT_STATUS_CLOSED", "ACCOUNT_TYPE_TINKOFF"),
+    ("ACCOUNT_STATUS_CLOSED", "ACCOUNT_TYPE_TINKOFF_IIS"),
     ("ACCOUNT_STATUS_NEW", "ACCOUNT_TYPE_TINKOFF"),
     ("ACCOUNT_STATUS_OPEN", "ACCOUNT_TYPE_INVEST_BOX"),
     ("ACCOUNT_STATUS_OPEN", "ACCOUNT_TYPE_UNSPECIFIED"),
@@ -240,16 +242,17 @@ def test_open_portfolios_form_one_snapshot_before_sheet_writes(clients, count):
     (None, "ACCOUNT_TYPE_TINKOFF"),
     ("ACCOUNT_STATUS_UNSPECIFIED", "ACCOUNT_TYPE_TINKOFF"),
 ])
-def test_ineligible_accounts_skip_portfolio_but_keep_operations_and_accounts(clients, status, account_type):
+@pytest.mark.parametrize("use_last_sheet_date", [False, True])
+def test_ineligible_accounts_skip_data_fetches_but_keep_snapshot(
+    clients, status, account_type, use_last_sheet_date,
+):
     settings, api, sheets, _, _ = clients
     account = Account("other", "Other", account_type, status)
     api.get_accounts.return_value = [account]
-    new = operation("new", account)
-    api.iter_operations.side_effect = lambda account, date_from: iter([new])
-    assert sync_operations(settings, date_from=FROM) == SyncResult(1, 1, 1, 0)
+    assert sync_operations(settings, use_last_sheet_date=use_last_sheet_date) == SyncResult(1, 0, 0, 0)
     api.get_portfolio.assert_not_called()
-    api.iter_operations.assert_called_once_with(account, FROM)
-    sheets.append_operations.assert_called_once_with([new])
+    api.iter_operations.assert_not_called()
+    sheets.append_operations.assert_called_once_with([])
     sheets.replace_accounts.assert_called_once_with([account])
     sheets.replace_positions.assert_called_once_with([], [account])
 
