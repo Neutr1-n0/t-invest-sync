@@ -1,6 +1,19 @@
 from __future__ import annotations
 
 from typing import Any
+from decimal import Decimal
+
+
+def money_to_decimal(value: dict[str, Any] | None) -> Decimal | None:
+    """Convert MoneyValue / Quotation exactly, independent of Decimal context.
+
+    An absent message is unknown; a present empty protobuf message is zero.
+    """
+    if value is None:
+        return None
+    nanounits = int(value.get("units", 0)) * 1_000_000_000 + int(value.get("nano", 0))
+    digits = tuple(int(digit) for digit in str(abs(nanounits)))
+    return Decimal((int(nanounits < 0), digits, -9))
 
 
 def money_to_float(value: dict[str, Any] | None) -> float | None:

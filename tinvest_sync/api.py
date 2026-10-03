@@ -3,12 +3,13 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Iterator
 
 import requests
 
 from tinvest_sync.config import API_BASE_URL
-from tinvest_sync.money import money_to_float, pick_currency
+from tinvest_sync.money import money_to_decimal, money_to_float, pick_currency
 
 
 class TInvestAPIError(RuntimeError):
@@ -24,6 +25,28 @@ class Account:
     opened_date: str | None = None
     closed_date: str | None = None
     access_level: str | None = None
+
+
+@dataclass(frozen=True)
+class Position:
+    """Actual PortfolioPosition; prices retain their API monetary units.
+
+    expected_yield is the position's Quotation, not portfolio yield percent.
+    quantity_lots is mapped only when the deprecated API field is present.
+    currency is unknown if price currencies are absent or disagree.
+    """
+
+    account_id: str
+    instrument_uid: str | None
+    figi: str | None
+    ticker: str | None
+    instrument_type: str | None
+    quantity: Decimal | None
+    quantity_lots: Decimal | None
+    current_price: Decimal | None
+    average_position_price: Decimal | None
+    expected_yield: Decimal | None
+    currency: str | None
 
 
 @dataclass(frozen=True)
@@ -92,6 +115,23 @@ class TInvestClient:
             )
         return result
 
+    def get_portfolio(self, account: Account) -> list[Position]:
+        """Load actual positions for an OPEN account; do not merge virtual positions.
+
+        OPEN-only is a conservative client policy: documentation does not
+        guarantee GetPortfolio availability for other account statuses.
+        Invest Box is explicitly unsupported by the Operations service.
+        """
+        if account.type == "ACCOUNT_TYPE_INVEST_BOX":
+            raise ValueError("GetPortfolio does not support Invest Box accounts")
+        if account.status != "ACCOUNT_STATUS_OPEN":
+            raise ValueError(f"GetPortfolio requires an OPEN account; status={account.status!r}")
+        data = self._post(
+            "tinkoff.public.invest.api.contract.v1.OperationsService/GetPortfolio",
+            {"accountId": account.id},
+        )
+        return [_map_position(item, account) for item in data.get("positions", [])]
+
     def iter_operations(
         self,
         account: Account,
@@ -139,6 +179,29 @@ class TInvestClient:
                     "GetOperationsByCursor pagination violation: "
                     f"nextCursor {cursor!r} has already been used"
                 )
+
+
+def _map_position(item: dict[str, Any], account: Account) -> Position:
+    current_price = item.get("currentPrice")
+    average_price = item.get("averagePositionPrice")
+    currencies = {
+        str(price["currency"]).lower()
+        for price in (current_price, average_price)
+        if price and price.get("currency")
+    }
+    return Position(
+        account_id=account.id,
+        instrument_uid=item.get("instrumentUid") or None,
+        figi=item.get("figi") or None,
+        ticker=item.get("ticker") or None,
+        instrument_type=item.get("instrumentType") or None,
+        quantity=money_to_decimal(item.get("quantity")),
+        quantity_lots=money_to_decimal(item.get("quantityLots")),
+        current_price=money_to_decimal(current_price),
+        average_position_price=money_to_decimal(average_price),
+        expected_yield=money_to_decimal(item.get("expectedYield")),
+        currency=next(iter(currencies)) if len(currencies) == 1 else None,
+    )
 
 
 def _to_api_timestamp(value: datetime) -> str:
