@@ -29,6 +29,11 @@ jobs:
       - name: Install project dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Build production CA bundle
+        run: |
+          python docker/build_ca_bundle.py ca_bundle.pem
+          test -s ca_bundle.pem
+
       - name: Write temporary Google service account credentials
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
@@ -99,7 +104,7 @@ jobs:
               redactions.extend([token, spreadsheet_id])
 
               stage = "GetAccounts"
-              client = TInvestClient(token)
+              client = TInvestClient(token, verify_ssl="ca_bundle.pem")
               emit("tls", {
                   "requests_version": requests.__version__,
                   "urllib3_version": urllib3.__version__,
@@ -120,7 +125,8 @@ jobs:
               try:
                   with requests.get(
                       "https://invest-public-api.tbank.ru/",
-                      timeout=15, auth=NoAuth(), allow_redirects=False,
+                      timeout=15, verify="ca_bundle.pem",
+                      auth=NoAuth(), allow_redirects=False,
                   ) as probe:
                       emit("https_probe", {"success": True, "status_code": probe.status_code})
               except requests.exceptions.RequestException as exc:
