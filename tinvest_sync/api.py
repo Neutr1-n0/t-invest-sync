@@ -20,6 +20,10 @@ class Account:
     id: str
     name: str
     type: str
+    status: str | None = None
+    opened_date: str | None = None
+    closed_date: str | None = None
+    access_level: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,7 +74,7 @@ class TInvestClient:
     def get_accounts(self) -> list[Account]:
         data = self._post(
             "tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
-            {"status": "ACCOUNT_STATUS_OPEN"},
+            {"status": "ACCOUNT_STATUS_ALL"},
         )
         accounts = data.get("accounts", [])
         result: list[Account] = []
@@ -80,6 +84,10 @@ class TInvestClient:
                     id=item.get("id", ""),
                     name=item.get("name", "") or item.get("id", ""),
                     type=item.get("type", "ACCOUNT_TYPE_UNSPECIFIED"),
+                    status=item.get("status"),
+                    opened_date=item.get("openedDate"),
+                    closed_date=item.get("closedDate"),
+                    access_level=item.get("accessLevel"),
                 )
             )
         return result

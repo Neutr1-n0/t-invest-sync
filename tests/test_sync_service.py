@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from tinvest_sync import sync_service
-from tinvest_sync.api import Account, Operation
+from tinvest_sync.api import Account, Operation, TInvestAPIError
 from tinvest_sync.config import Settings
 from tinvest_sync.sync_service import SyncResult, sync_operations
 
@@ -138,3 +138,32 @@ def test_default_start_date(clients):
         datetime(2020, 5, 6, tzinfo=timezone.utc),
     ]
     sheets.get_last_operation_dates_by_account.assert_not_called()
+
+
+@pytest.mark.parametrize("other_status", ["ACCOUNT_STATUS_CLOSED", "ACCOUNT_STATUS_NEW"])
+def test_sync_processes_other_statuses_the_same_as_open(clients, other_status):
+    settings, api, sheets, _, _ = clients
+    opened = Account("open", "Broker", "broker", status="ACCOUNT_STATUS_OPEN")
+    other = Account("other", "Other", "broker", status=other_status)
+    api.get_accounts.return_value = [opened, other]
+    operations = [operation("open-operation", opened), operation("other-operation", other)]
+    api.iter_operations.side_effect = [iter([operations[0]]), iter([operations[1]])]
+
+    assert sync_operations(settings, date_from=FROM) == SyncResult(2, 2, 2, 0)
+    assert [call.args for call in api.iter_operations.call_args_list] == [
+        (opened, FROM), (other, FROM),
+    ]
+    sheets.append_operations.assert_called_once_with(operations)
+
+
+def test_new_account_api_error_still_aborts_sync_without_append(clients):
+    settings, api, sheets, _, _ = clients
+    api.get_accounts.return_value = [
+        Account("open", "Broker", "broker", status="ACCOUNT_STATUS_OPEN"),
+        Account("new", "New", "broker", status="ACCOUNT_STATUS_NEW"),
+    ]
+    api.iter_operations.side_effect = [iter([operation("one")]), TInvestAPIError("account unavailable")]
+    with pytest.raises(TInvestAPIError, match="account unavailable"):
+        sync_operations(settings, date_from=FROM)
+    assert api.iter_operations.call_count == 2
+    sheets.append_operations.assert_not_called()

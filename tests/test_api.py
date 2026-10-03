@@ -20,6 +20,70 @@ def client_with_pages(monkeypatch, pages):
     return client, post
 
 
+def test_get_accounts_requests_all_statuses(monkeypatch):
+    client, post = client_with_pages(monkeypatch, [{"accounts": []}])
+    assert client.get_accounts() == []
+    post.assert_called_once_with(
+        "tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
+        {"status": "ACCOUNT_STATUS_ALL"},
+    )
+
+
+@pytest.mark.parametrize("status,closed_date", [
+    ("ACCOUNT_STATUS_OPEN", None),
+    ("ACCOUNT_STATUS_CLOSED", "2024-02-01T12:00:00Z"),
+])
+def test_get_accounts_maps_open_and_closed_metadata(monkeypatch, status, closed_date):
+    item = {"id": "account-1", "name": "Broker", "type": "ACCOUNT_TYPE_TINKOFF",
+            "status": status, "openedDate": "2020-01-02T10:00:00.123Z",
+            "accessLevel": "ACCOUNT_ACCESS_LEVEL_READ_ONLY"}
+    if closed_date is not None:
+        item["closedDate"] = closed_date
+    client, _ = client_with_pages(monkeypatch, [{"accounts": [item]}])
+    assert client.get_accounts() == [Account(
+        "account-1", "Broker", "ACCOUNT_TYPE_TINKOFF", status=status,
+        opened_date="2020-01-02T10:00:00.123Z", closed_date=closed_date,
+        access_level="ACCOUNT_ACCESS_LEVEL_READ_ONLY",
+    )]
+
+
+@pytest.mark.parametrize("date_fields,opened_date,closed_date", [
+    ({}, None, None),
+    ({"openedDate": None, "closedDate": None}, None, None),
+    ({"openedDate": "2020-01-01T00:00:00Z"}, "2020-01-01T00:00:00Z", None),
+    ({"closedDate": "2024-01-01T00:00:00Z"}, None, "2024-01-01T00:00:00Z"),
+])
+def test_get_accounts_dates_are_optional(monkeypatch, date_fields, opened_date, closed_date):
+    client, _ = client_with_pages(monkeypatch, [{"accounts": [
+        {"id": "account-1", "status": "ACCOUNT_STATUS_CLOSED", **date_fields},
+    ]}])
+    account, = client.get_accounts()
+    assert account.opened_date == opened_date
+    assert account.closed_date == closed_date
+
+
+def test_get_accounts_without_metadata_preserves_legacy_defaults(monkeypatch):
+    client, _ = client_with_pages(monkeypatch, [{"accounts": [
+        {"id": "legacy", "name": ""},
+    ]}])
+    account, = client.get_accounts()
+    assert account == Account("legacy", "legacy", "ACCOUNT_TYPE_UNSPECIFIED")
+    assert (account.status, account.opened_date, account.closed_date, account.access_level) == (
+        None, None, None, None,
+    )
+
+
+def test_get_accounts_does_not_filter_any_returned_status(monkeypatch):
+    statuses = ["ACCOUNT_STATUS_OPEN", "ACCOUNT_STATUS_CLOSED", "ACCOUNT_STATUS_NEW",
+                "ACCOUNT_STATUS_UNSPECIFIED", "FUTURE_STATUS"]
+    client, _ = client_with_pages(monkeypatch, [{"accounts": [
+        {"id": str(index), "status": status} for index, status in enumerate(statuses)
+    ]}])
+    accounts = client.get_accounts()
+    assert [account.id for account in accounts] == [str(index) for index in range(len(statuses))]
+    assert [account.status for account in accounts] == statuses
+
+
 def test_multiple_pages_preserve_items_and_send_cursor(monkeypatch):
     client, post = client_with_pages(monkeypatch, [
         {"items": [{"id": "one"}, {"id": "two"}], "hasNext": True, "nextCursor": "page-2"},
