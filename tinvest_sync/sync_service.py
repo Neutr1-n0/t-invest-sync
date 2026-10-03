@@ -63,6 +63,7 @@ def sync_operations(
             existing_ids.add(operation.operation_id)
 
     appended = sheets.append_operations(new_operations)
+    sheets.replace_accounts(accounts)
 
     return SyncResult(
         accounts=len(accounts),

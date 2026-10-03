@@ -10,6 +10,17 @@ load_dotenv()
 
 API_BASE_URL = "https://invest-public-api.tbank.ru/rest"
 SHEET_NAME = "operations"
+ACCOUNTS_SHEET_NAME = "accounts"
+ACCOUNTS_HEADERS_ROW = [
+    "updated_at",
+    "account_id",
+    "account_name",
+    "account_type",
+    "status",
+    "opened_date",
+    "closed_date",
+    "access_level",
+]
 CA_BUNDLE_FILE = Path(__file__).resolve().parent.parent / "ca_bundle.pem"
 HEADERS_ROW = [
     "date",

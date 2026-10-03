@@ -7,8 +7,8 @@ from typing import Iterable
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from tinvest_sync.api import Operation
-from tinvest_sync.config import HEADERS_ROW, SHEET_NAME
+from tinvest_sync.api import Account, Operation
+from tinvest_sync.config import ACCOUNTS_HEADERS_ROW, ACCOUNTS_SHEET_NAME, HEADERS_ROW, SHEET_NAME
 
 # Эпоха Google Sheets / Excel serial date (Lotus 1-2-3 наследие): 1899-12-30.
 _SHEETS_EPOCH = datetime(1899, 12, 30)
@@ -109,6 +109,54 @@ class SheetsClient:
             body={"values": rows},
         ).execute()
         return len(rows)
+
+    def replace_accounts(self, accounts: Iterable[Account]) -> None:
+        """Replace the account snapshot, including headers and stale data rows."""
+        updated_at = datetime.now(timezone.utc).isoformat()
+        rows = [ACCOUNTS_HEADERS_ROW] + [
+            [updated_at, account.id, account.name, account.type,
+             account.status or "", account.opened_date or "",
+             account.closed_date or "", account.access_level or ""]
+            for account in sorted(accounts, key=lambda account: account.id)
+        ]
+        spreadsheet = self._service.get(spreadsheetId=self._spreadsheet_id).execute()
+        properties = next(
+            (sheet["properties"] for sheet in spreadsheet["sheets"]
+             if sheet["properties"]["title"] == ACCOUNTS_SHEET_NAME),
+            None,
+        )
+        if properties is None:
+            result = self._service.batchUpdate(
+                spreadsheetId=self._spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {
+                    "title": ACCOUNTS_SHEET_NAME,
+                    "gridProperties": {"rowCount": max(1000, len(rows)), "columnCount": 8},
+                }}}]},
+            ).execute()
+            properties = result["replies"][0]["addSheet"]["properties"]
+
+        sheet_id = properties["sheetId"]
+        grid = properties["gridProperties"]
+        requests = []
+        for dimension, current, required in (
+            ("ROWS", grid["rowCount"], len(rows)),
+            ("COLUMNS", grid["columnCount"], len(ACCOUNTS_HEADERS_ROW)),
+        ):
+            if current < required:
+                requests.append({"appendDimension": {
+                    "sheetId": sheet_id, "dimension": dimension, "length": required - current,
+                }})
+        # A range without endRowIndex also clears values below the new snapshot.
+        requests.append({"updateCells": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0,
+                      "startColumnIndex": 0, "endColumnIndex": len(ACCOUNTS_HEADERS_ROW)},
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": value}}
+                                  for value in row]} for row in rows],
+            "fields": "userEnteredValue",
+        }})
+        self._service.batchUpdate(
+            spreadsheetId=self._spreadsheet_id, body={"requests": requests},
+        ).execute()
 
     def _get_values(
         self, range_name: str, value_render_option: str = "FORMATTED_VALUE"

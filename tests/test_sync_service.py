@@ -47,6 +47,11 @@ def test_multiple_accounts_existing_and_new_operations_and_statistics(clients):
 
     assert result == SyncResult(accounts=2, fetched=5, appended=2, skipped_duplicates=3)
     sheets.append_operations.assert_called_once_with([first, second])
+    sheets.replace_accounts.assert_called_once_with([A, B])
+    assert sheets.method_calls[-2:] == [
+        ("append_operations", ([first, second],), {}),
+        ("replace_accounts", ([A, B],), {}),
+    ]
     assert api.iter_operations.call_args_list[0].args == (A, FROM)
     assert api.iter_operations.call_args_list[1].args == (B, FROM)
     api_factory.assert_called_once_with("test-token", verify_ssl=False)
@@ -69,6 +74,7 @@ def test_empty_existing_only_and_new_only(clients, accounts, items, existing, ex
     sheets.get_existing_operation_ids.return_value = existing
     assert sync_operations(settings, date_from=FROM) == expected
     sheets.append_operations.assert_called_once_with(items if expected.appended else [])
+    sheets.replace_accounts.assert_called_once_with(accounts)
 
 
 def test_same_id_across_accounts_is_deduplicated_globally(clients):
@@ -93,6 +99,7 @@ def test_api_failure_does_not_append_partial_account_data(clients):
     with pytest.raises(RuntimeError, match="API unavailable"):
         sync_operations(settings, date_from=FROM)
     sheets.append_operations.assert_not_called()
+    sheets.replace_accounts.assert_not_called()
 
 
 @pytest.mark.parametrize("last_dates,expected", [
@@ -167,3 +174,24 @@ def test_new_account_api_error_still_aborts_sync_without_append(clients):
         sync_operations(settings, date_from=FROM)
     assert api.iter_operations.call_count == 2
     sheets.append_operations.assert_not_called()
+    sheets.replace_accounts.assert_not_called()
+
+
+def test_snapshot_failure_propagates_after_operations_append(clients):
+    settings, api, sheets, _, _ = clients
+    api.get_accounts.return_value = [A]
+    new = operation("new")
+    api.iter_operations.side_effect = lambda account, date_from: iter([new])
+    sheets.replace_accounts.side_effect = RuntimeError("accounts write failed")
+    with pytest.raises(RuntimeError, match="accounts write failed"):
+        sync_operations(settings, date_from=FROM)
+    sheets.append_operations.assert_called_once_with([new])
+    sheets.replace_accounts.assert_called_once_with([A])
+
+
+def test_operations_write_failure_does_not_replace_snapshot(clients):
+    settings, _, sheets, _, _ = clients
+    sheets.append_operations.side_effect = RuntimeError("operations write failed")
+    with pytest.raises(RuntimeError, match="operations write failed"):
+        sync_operations(settings, date_from=FROM)
+    sheets.replace_accounts.assert_not_called()
