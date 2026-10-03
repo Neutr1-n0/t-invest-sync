@@ -94,6 +94,7 @@ class TInvestClient:
             date_to = datetime.now(timezone.utc)
 
         cursor = ""
+        used_cursors: set[str] = set()
         has_next = True
 
         while has_next:
@@ -107,6 +108,7 @@ class TInvestClient:
             }
             if cursor:
                 payload["cursor"] = cursor
+                used_cursors.add(cursor)
 
             data = self._post(
                 "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
@@ -120,7 +122,15 @@ class TInvestClient:
             has_next = bool(data.get("hasNext", data.get("has_next", False)))
             cursor = data.get("nextCursor", data.get("next_cursor", ""))
             if has_next and not cursor:
-                break
+                raise TInvestAPIError(
+                    "GetOperationsByCursor pagination violation: "
+                    "hasNext=true but nextCursor is missing or empty"
+                )
+            if has_next and cursor in used_cursors:
+                raise TInvestAPIError(
+                    "GetOperationsByCursor pagination violation: "
+                    f"nextCursor {cursor!r} has already been used"
+                )
 
 
 def _to_api_timestamp(value: datetime) -> str:

@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tinvest_sync.api import Account, Operation, TInvestClient
+from tinvest_sync.api import Account, Operation, TInvestAPIError, TInvestClient
 
 
 ACCOUNT = Account("account-1", "Broker", "ACCOUNT_TYPE_TINKOFF")
@@ -66,12 +66,13 @@ def test_snake_case_pagination_fields(monkeypatch):
     assert post.call_args_list[1].args[1]["cursor"] == "next"
 
 
-def test_missing_next_cursor_currently_stops_silently(monkeypatch):
-    """Known risk: incomplete pagination is returned as a successful result."""
+@pytest.mark.parametrize("cursor_fields", [{}, {"nextCursor": ""}, {"nextCursor": None}])
+def test_missing_next_cursor_raises_pagination_error(monkeypatch, cursor_fields):
     client, post = client_with_pages(monkeypatch, [
-        {"items": [{"id": "one"}], "hasNext": True},
+        {"items": [{"id": "one"}], "hasNext": True, **cursor_fields},
     ])
-    assert [op.operation_id for op in client.iter_operations(ACCOUNT, FROM, TO)] == ["one"]
+    with pytest.raises(TInvestAPIError, match="pagination violation:.*nextCursor is missing or empty"):
+        list(client.iter_operations(ACCOUNT, FROM, TO))
     post.assert_called_once()
 
 
@@ -115,17 +116,21 @@ def test_request_dates_are_normalized_to_utc(monkeypatch):
     assert post.call_args.args[1]["to"] == "2024-02-01T00:00:00Z"
 
 
-def test_repeated_cursor_has_no_progress_guard(monkeypatch):
-    """Bound the generator: a repeated cursor currently causes another request."""
+@pytest.mark.parametrize("cursors", [("same", "same"), ("first", "second", "first")])
+def test_repeated_cursor_raises_before_another_request(monkeypatch, cursors):
+    client, post = client_with_pages(monkeypatch, [
+        {"items": [{"id": str(index)}], "hasNext": True, "nextCursor": cursor}
+        for index, cursor in enumerate(cursors)
+    ])
+    with pytest.raises(TInvestAPIError, match="pagination violation:.*has already been used"):
+        list(client.iter_operations(ACCOUNT, FROM, TO))
+    assert post.call_count == len(cursors)
+
+
+def test_terminal_page_allows_previously_used_cursor(monkeypatch):
     client, post = client_with_pages(monkeypatch, [
         {"items": [{"id": "one"}], "hasNext": True, "nextCursor": "same"},
-        {"items": [{"id": "two"}], "hasNext": True, "nextCursor": "same"},
-        {"items": [{"id": "three"}], "hasNext": True, "nextCursor": "same"},
+        {"items": [{"id": "two"}], "hasNext": False, "nextCursor": "same"},
     ])
-    iterator = client.iter_operations(ACCOUNT, FROM, TO)
-    try:
-        assert [next(iterator).operation_id for _ in range(3)] == ["one", "two", "three"]
-        assert post.call_args_list[1].args[1]["cursor"] == "same"
-        assert post.call_args_list[2].args[1]["cursor"] == "same"
-    finally:
-        iterator.close()
+    assert [op.operation_id for op in client.iter_operations(ACCOUNT, FROM, TO)] == ["one", "two"]
+    assert post.call_count == 2
