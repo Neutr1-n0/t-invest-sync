@@ -53,6 +53,7 @@ jobs:
           import re
           import ssl
           import sys
+          from datetime import datetime, timezone
           from pathlib import Path
 
           import certifi
@@ -62,6 +63,7 @@ jobs:
           from google.oauth2.service_account import Credentials
           from googleapiclient.discovery import build
           from tinvest_sync.api import TInvestClient
+          from tinvest_sync.sheets import _normalize_sheet_date
 
           stage = "configuration"
           redactions = []
@@ -95,6 +97,37 @@ jobs:
                   "context_type": type(exc.__context__).__name__ if exc.__context__ else None,
                   "reason": sanitized_reason(exc),
               })
+
+          def operation_watermarks(values):
+              # Match production get_last_operation_dates_by_account semantics.
+              dates = {}
+              for row in values[1:]:
+                  if len(row) < 3:
+                      continue
+                  raw_account_id = row[2]
+                  if isinstance(raw_account_id, str):
+                      account_id = raw_account_id.strip()
+                  elif isinstance(raw_account_id, int) and not isinstance(raw_account_id, bool):
+                      account_id = str(raw_account_id)
+                  elif isinstance(raw_account_id, float) and raw_account_id.is_integer():
+                      account_id = str(int(raw_account_id))
+                  else:
+                      continue
+                  if not account_id or isinstance(row[0], bool):
+                      continue
+                  try:
+                      text = _normalize_sheet_date(row[0])
+                      if not text:
+                          continue
+                      date = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                      if date.tzinfo is None:
+                          date = date.replace(tzinfo=timezone.utc)
+                      date = date.astimezone(timezone.utc)
+                  except (ValueError, OverflowError):
+                      continue
+                  if account_id not in dates or date > dates[account_id]:
+                      dates[account_id] = date
+              return dates
 
           try:
               token = os.environ["TINVEST_TOKEN"].strip()
@@ -181,6 +214,39 @@ jobs:
                   sheet["properties"]["title"]
                   for sheet in spreadsheet.get("sheets", [])
               ])
+
+              stage = "Google Sheets operations watermarks"
+              values = service.values().get(
+                  spreadsheetId=spreadsheet_id,
+                  range="operations!A:C",
+                  valueRenderOption="UNFORMATTED_VALUE",
+              ).execute().get("values", [])
+              watermarks = operation_watermarks(values)
+              eligible_count = 0
+              missing_ids = []
+              for account in accounts:
+                  masked_id = "***" + account.id[-4:] if len(account.id) > 4 else "***"
+                  eligible = account.status == "ACCOUNT_STATUS_OPEN" and account.type in (
+                      "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_TYPE_TINKOFF_IIS",
+                  )
+                  watermark = watermarks.get(account.id)
+                  emit("account_watermark", {
+                      "masked_account_id": masked_id,
+                      "type": account.type,
+                      "status": account.status,
+                      "eligible": eligible,
+                      "operations_watermark": watermark.isoformat() if watermark else "MISSING",
+                  })
+                  if eligible:
+                      eligible_count += 1
+                      if watermark is None:
+                          missing_ids.append(masked_id)
+              emit("watermark_preflight", {
+                  "eligible_accounts_count": eligible_count,
+                  "eligible_with_watermark": eligible_count - len(missing_ids),
+                  "eligible_missing_watermark": len(missing_ids),
+                  "eligible_missing_masked_ids": missing_ids,
+              })
           except requests.exceptions.SSLError as exc:
               emit_exception("tls_failure", exc)
               print(f"Smoke FAILED at {stage}: {type(exc).__name__}", file=sys.stderr)
