@@ -1,0 +1,133 @@
+name: Portfolio read-only smoke
+
+on:
+  push:
+    branches:
+      - feature/portfolio-data
+    paths:
+      - ".github/workflows/smoke-readonly.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Write temporary Google service account credentials
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          umask 077
+          printf '%s' "$GOOGLE_CREDENTIALS_JSON" > "$RUNNER_TEMP/credentials.json"
+
+      - name: Check T-Invest portfolios and Google Sheets metadata
+        env:
+          TINVEST_TOKEN: ${{ secrets.TINVEST_TOKEN }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_FILE: ${{ runner.temp }}/credentials.json
+        run: |
+          python -u - <<'PY'
+          import json
+          import os
+          import sys
+
+          from google.oauth2.service_account import Credentials
+          from googleapiclient.discovery import build
+          from tinvest_sync.api import TInvestClient
+
+          stage = "configuration"
+          redactions = []
+
+          def emit(label, value):
+              text = json.dumps(value, ensure_ascii=True, default=str)
+              for secret in sorted(set(redactions), key=len, reverse=True):
+                  if secret:
+                      text = text.replace(json.dumps(secret)[1:-1], "[redacted]")
+              # Prefix prevents API-provided text from becoming a runner command.
+              print(f"{label}: {text}")
+
+          try:
+              token = os.environ["TINVEST_TOKEN"].strip()
+              spreadsheet_id = os.environ["GOOGLE_SPREADSHEET_ID"].strip()
+              if not token or not spreadsheet_id:
+                  raise ValueError("Missing configuration")
+              redactions.extend([token, spreadsheet_id])
+
+              stage = "GetAccounts"
+              client = TInvestClient(token)
+              accounts = client.get_accounts()
+              redactions.extend(account.id for account in accounts)
+              emit("accounts_count", len(accounts))
+
+              for account in accounts:
+                  masked_id = "***" + account.id[-4:] if len(account.id) > 4 else "***"
+                  emit("account", {
+                      "account_id": masked_id,
+                      "type": account.type,
+                      "status": account.status,
+                  })
+                  if account.status != "ACCOUNT_STATUS_OPEN" or account.type not in (
+                      "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_TYPE_TINKOFF_IIS",
+                  ):
+                      continue
+
+                  stage = "GetPortfolio"
+                  positions = client.get_portfolio(account)
+                  emit("portfolio", {
+                      "account_id": masked_id,
+                      "positions_count": len(positions),
+                  })
+                  for position in positions[:3]:
+                      emit("position", {
+                          "ticker": position.ticker,
+                          "instrument_type": position.instrument_type,
+                          "quantity": position.quantity,
+                          "current_price": position.current_price,
+                          "currency": position.currency,
+                          "expected_yield": position.expected_yield,
+                      })
+
+              stage = "Google Sheets metadata"
+              credentials = Credentials.from_service_account_file(
+                  os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"],
+                  scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+              )
+              service = build(
+                  "sheets", "v4", credentials=credentials, cache_discovery=False,
+              ).spreadsheets()
+              spreadsheet = service.get(
+                  spreadsheetId=spreadsheet_id,
+                  fields="properties.title,sheets.properties.title",
+              ).execute()
+              emit("spreadsheet_title", spreadsheet["properties"]["title"])
+              emit("sheet_titles", [
+                  sheet["properties"]["title"]
+                  for sheet in spreadsheet.get("sheets", [])
+              ])
+          except Exception as exc:
+              # Exception bodies and tracebacks may contain IDs or API responses.
+              print(f"Smoke FAILED at {stage}: {type(exc).__name__}", file=sys.stderr)
+              sys.exit(1)
+
+          print("Read-only smoke PASSED")
+          PY
+
+      - name: Clean up temporary credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/credentials.json"
