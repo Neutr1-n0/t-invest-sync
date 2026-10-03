@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -60,20 +60,41 @@ class SheetsClient:
 
         return {row[0] for row in values[1:] if row and row[0]}
 
-    def get_last_operation_date(self) -> str | None:
+    def get_last_operation_dates_by_account(self) -> dict[str, datetime]:
+        """Read per-account maxima in UTC, ignoring incomplete or invalid rows."""
         values = self._get_values(
-            f"{SHEET_NAME}!A:A", value_render_option="UNFORMATTED_VALUE"
+            f"{SHEET_NAME}!A:C", value_render_option="UNFORMATTED_VALUE"
         )
-        if len(values) <= 1:
-            return None
-
-        dates = [
-            _normalize_sheet_date(row[0])
-            for row in values[1:]
-            if row and row[0] not in (None, "")
-        ]
-        dates = [d for d in dates if d]
-        return max(dates) if dates else None
+        dates: dict[str, datetime] = {}
+        for row in values[1:]:
+            if len(row) < 3:
+                continue
+            raw_account_id = row[2]
+            if isinstance(raw_account_id, str):
+                account_id = raw_account_id.strip()
+            elif isinstance(raw_account_id, int) and not isinstance(raw_account_id, bool):
+                account_id = str(raw_account_id)
+            elif isinstance(raw_account_id, float) and raw_account_id.is_integer():
+                account_id = str(int(raw_account_id))
+            else:
+                continue
+            if not account_id:
+                continue
+            if isinstance(row[0], bool):
+                continue
+            try:
+                text = _normalize_sheet_date(row[0])
+                if not text:
+                    continue
+                date = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                date = date.astimezone(timezone.utc)
+            except (ValueError, OverflowError):
+                continue
+            if account_id not in dates or date > dates[account_id]:
+                dates[account_id] = date
+        return dates
 
     def append_operations(self, operations: Iterable[Operation]) -> int:
         rows = [_operation_to_row(operation) for operation in operations]
@@ -91,7 +112,7 @@ class SheetsClient:
 
     def _get_values(
         self, range_name: str, value_render_option: str = "FORMATTED_VALUE"
-    ) -> list[list[str]]:
+    ) -> list[list[object]]:
         result = (
             self._service.values()
             .get(

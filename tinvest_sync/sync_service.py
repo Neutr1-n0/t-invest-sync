@@ -37,15 +37,11 @@ def sync_operations(
     sheets = SheetsClient(settings.spreadsheet_id, settings.service_account_file)
     sheets.ensure_sheet()
 
+    last_dates: dict[str, datetime] = {}
     if date_from is None:
         if use_last_sheet_date:
-            last_date = sheets.get_last_operation_date()
-            if last_date:
-                date_from = parse_from_date(last_date) - timedelta(days=1)
-            else:
-                date_from = parse_from_date(settings.default_from_date)
-        else:
-            date_from = parse_from_date(settings.default_from_date)
+            last_dates = sheets.get_last_operation_dates_by_account()
+        date_from = parse_from_date(settings.default_from_date)
 
     existing_ids = sheets.get_existing_operation_ids()
     accounts = client.get_accounts()
@@ -55,7 +51,10 @@ def sync_operations(
     new_operations = []
 
     for account in accounts:
-        for operation in client.iter_operations(account, date_from):
+        account_date_from = date_from
+        if account.id in last_dates:
+            account_date_from = last_dates[account.id] - timedelta(days=1)
+        for operation in client.iter_operations(account, account_date_from):
             fetched += 1
             if operation.operation_id in existing_ids:
                 skipped += 1

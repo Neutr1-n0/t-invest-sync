@@ -27,7 +27,7 @@ def clients(monkeypatch):
     api.get_accounts.return_value = [A, B]
     api.iter_operations.side_effect = lambda account, date_from: iter([])
     sheets.get_existing_operation_ids.return_value = set()
-    sheets.get_last_operation_date.return_value = None
+    sheets.get_last_operation_dates_by_account.return_value = {}
     sheets.append_operations.side_effect = lambda operations: len(operations)
     api_factory, sheets_factory = Mock(return_value=api), Mock(return_value=sheets)
     monkeypatch.setattr(sync_service, "TInvestClient", api_factory)
@@ -53,7 +53,7 @@ def test_multiple_accounts_existing_and_new_operations_and_statistics(clients):
     sheets_factory.assert_called_once_with("test-sheet", settings.service_account_file)
     sheets.ensure_sheet.assert_called_once_with()
     sheets.get_existing_operation_ids.assert_called_once_with()
-    sheets.get_last_operation_date.assert_not_called()
+    sheets.get_last_operation_dates_by_account.assert_not_called()
 
 
 @pytest.mark.parametrize("accounts,items,existing,expected", [
@@ -95,22 +95,46 @@ def test_api_failure_does_not_append_partial_account_data(clients):
     sheets.append_operations.assert_not_called()
 
 
-@pytest.mark.parametrize("last_date,expected", [
-    ("2024-02-03 12:30:00", datetime(2024, 2, 2, 12, 30, tzinfo=timezone.utc)),
-    (None, datetime(2019, 1, 1, tzinfo=timezone.utc)),
+@pytest.mark.parametrize("last_dates,expected", [
+    ({A.id: datetime(2024, 2, 3, 12, 30, tzinfo=timezone.utc),
+      B.id: datetime(2024, 3, 4, tzinfo=timezone.utc)},
+     [datetime(2024, 2, 2, 12, 30, tzinfo=timezone.utc),
+      datetime(2024, 3, 3, tzinfo=timezone.utc)]),
+    ({A.id: datetime(2024, 2, 3, 12, 30, tzinfo=timezone.utc)},
+     [datetime(2024, 2, 2, 12, 30, tzinfo=timezone.utc),
+      datetime(2019, 1, 1, tzinfo=timezone.utc)]),
+    ({}, [datetime(2019, 1, 1, tzinfo=timezone.utc)] * 2),
 ])
-def test_from_last_preserves_existing_overlap_and_fallback(clients, last_date, expected):
+def test_from_last_uses_per_account_overlap_and_fallback(clients, last_dates, expected):
     settings, api, sheets, _, _ = clients
-    sheets.get_last_operation_date.return_value = last_date
+    sheets.get_last_operation_dates_by_account.return_value = last_dates
     sync_operations(settings, use_last_sheet_date=True)
-    assert [call.args[1] for call in api.iter_operations.call_args_list] == [expected, expected]
+    assert [call.args for call in api.iter_operations.call_args_list] == [
+        (A, expected[0]), (B, expected[1]),
+    ]
+    sheets.get_last_operation_dates_by_account.assert_called_once_with()
+
+
+def test_explicit_start_date_takes_priority_over_from_last(clients):
+    settings, api, sheets, _, _ = clients
+    sheets.get_last_operation_dates_by_account.return_value = {
+        A.id: datetime(2024, 2, 3, tzinfo=timezone.utc),
+    }
+    sync_operations(settings, date_from=FROM, use_last_sheet_date=True)
+    assert [call.args for call in api.iter_operations.call_args_list] == [(A, FROM), (B, FROM)]
+    sheets.get_last_operation_dates_by_account.assert_not_called()
 
 
 def test_default_start_date(clients):
     settings, api, sheets, _, _ = clients
+    settings = Settings(settings.tinvest_token, settings.spreadsheet_id,
+                        settings.service_account_file, default_from_date="2020-05-06")
+    sheets.get_last_operation_dates_by_account.return_value = {
+        A.id: datetime(2024, 2, 3, tzinfo=timezone.utc),
+    }
     sync_operations(settings)
     assert [call.args[1] for call in api.iter_operations.call_args_list] == [
-        datetime(2019, 1, 1, tzinfo=timezone.utc),
-        datetime(2019, 1, 1, tzinfo=timezone.utc),
+        datetime(2020, 5, 6, tzinfo=timezone.utc),
+        datetime(2020, 5, 6, tzinfo=timezone.utc),
     ]
-    sheets.get_last_operation_date.assert_not_called()
+    sheets.get_last_operation_dates_by_account.assert_not_called()
