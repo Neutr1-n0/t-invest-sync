@@ -11,6 +11,22 @@ load_dotenv()
 API_BASE_URL = "https://invest-public-api.tbank.ru/rest"
 SHEET_NAME = "operations"
 ACCOUNTS_SHEET_NAME = "accounts"
+POSITIONS_SHEET_NAME = "positions"
+POSITIONS_HEADERS_ROW = [
+    "updated_at",
+    "account_id",
+    "account_name",
+    "instrument_uid",
+    "figi",
+    "ticker",
+    "instrument_type",
+    "quantity",
+    "quantity_lots",
+    "currency",
+    "current_price",
+    "average_position_price",
+    "expected_yield",
+]
 ACCOUNTS_HEADERS_ROW = [
     "updated_at",
     "account_id",

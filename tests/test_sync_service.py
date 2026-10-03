@@ -1,12 +1,12 @@
 """Service-level tests with mocked API and Sheets clients."""
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
 from tinvest_sync import sync_service
-from tinvest_sync.api import Account, Operation, TInvestAPIError
+from tinvest_sync.api import Account, Operation, Position, TInvestAPIError
 from tinvest_sync.config import Settings
 from tinvest_sync.sync_service import SyncResult, sync_operations
 
@@ -25,6 +25,7 @@ def operation(identifier, account=A):
 def clients(monkeypatch):
     api, sheets = Mock(), Mock()
     api.get_accounts.return_value = [A, B]
+    api.get_portfolio.return_value = []
     api.iter_operations.side_effect = lambda account, date_from: iter([])
     sheets.get_existing_operation_ids.return_value = set()
     sheets.get_last_operation_dates_by_account.return_value = {}
@@ -48,9 +49,10 @@ def test_multiple_accounts_existing_and_new_operations_and_statistics(clients):
     assert result == SyncResult(accounts=2, fetched=5, appended=2, skipped_duplicates=3)
     sheets.append_operations.assert_called_once_with([first, second])
     sheets.replace_accounts.assert_called_once_with([A, B])
-    assert sheets.method_calls[-2:] == [
+    assert sheets.method_calls[-3:] == [
         ("append_operations", ([first, second],), {}),
         ("replace_accounts", ([A, B],), {}),
+        ("replace_positions", ([], [A, B]), {}),
     ]
     assert api.iter_operations.call_args_list[0].args == (A, FROM)
     assert api.iter_operations.call_args_list[1].args == (B, FROM)
@@ -195,3 +197,93 @@ def test_operations_write_failure_does_not_replace_snapshot(clients):
     with pytest.raises(RuntimeError, match="operations write failed"):
         sync_operations(settings, date_from=FROM)
     sheets.replace_accounts.assert_not_called()
+    sheets.replace_positions.assert_not_called()
+
+
+def position(account):
+    return Position(account.id, "uid", "figi", "TEST", "share",
+                    None, None, None, None, None, None)
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_open_portfolios_form_one_snapshot_before_sheet_writes(clients, count):
+    settings, api, sheets, _, _ = clients
+    accounts = [
+        Account("open", "Broker", "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_STATUS_OPEN"),
+        Account("iis", "IIS", "ACCOUNT_TYPE_TINKOFF_IIS", "ACCOUNT_STATUS_OPEN"),
+    ][:count]
+    api.get_accounts.return_value = accounts
+    api.get_portfolio.side_effect = lambda account: [position(account)]
+    timeline = Mock()
+    timeline.attach_mock(api, "api")
+    timeline.attach_mock(sheets, "sheets")
+
+    assert sync_operations(settings, date_from=FROM) == SyncResult(count, 0, 0, 0)
+    assert api.get_portfolio.call_args_list == [call(account) for account in accounts]
+    sheets.replace_positions.assert_called_once_with([position(a) for a in accounts], accounts)
+    assert timeline.method_calls[:count + 2] == [
+        call.api.get_accounts(), *[call.api.get_portfolio(a) for a in accounts],
+        call.sheets.ensure_sheet(),
+    ]
+    assert timeline.method_calls[-3:] == [
+        call.sheets.append_operations([]), call.sheets.replace_accounts(accounts),
+        call.sheets.replace_positions([position(a) for a in accounts], accounts),
+    ]
+
+
+@pytest.mark.parametrize("status,account_type", [
+    ("ACCOUNT_STATUS_CLOSED", "ACCOUNT_TYPE_TINKOFF"),
+    ("ACCOUNT_STATUS_NEW", "ACCOUNT_TYPE_TINKOFF"),
+    ("ACCOUNT_STATUS_OPEN", "ACCOUNT_TYPE_INVEST_BOX"),
+    ("ACCOUNT_STATUS_OPEN", "ACCOUNT_TYPE_UNSPECIFIED"),
+    ("ACCOUNT_STATUS_OPEN", "FUTURE_ACCOUNT_TYPE"),
+    (None, "ACCOUNT_TYPE_TINKOFF"),
+    ("ACCOUNT_STATUS_UNSPECIFIED", "ACCOUNT_TYPE_TINKOFF"),
+])
+def test_ineligible_accounts_skip_portfolio_but_keep_operations_and_accounts(clients, status, account_type):
+    settings, api, sheets, _, _ = clients
+    account = Account("other", "Other", account_type, status)
+    api.get_accounts.return_value = [account]
+    new = operation("new", account)
+    api.iter_operations.side_effect = lambda account, date_from: iter([new])
+    assert sync_operations(settings, date_from=FROM) == SyncResult(1, 1, 1, 0)
+    api.get_portfolio.assert_not_called()
+    api.iter_operations.assert_called_once_with(account, FROM)
+    sheets.append_operations.assert_called_once_with([new])
+    sheets.replace_accounts.assert_called_once_with([account])
+    sheets.replace_positions.assert_called_once_with([], [account])
+
+
+def test_empty_open_portfolio_replaces_old_snapshot(clients):
+    settings, api, sheets, _, _ = clients
+    account = Account("open", "Broker", "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_STATUS_OPEN")
+    api.get_accounts.return_value = [account]
+    sync_operations(settings, date_from=FROM)
+    api.get_portfolio.assert_called_once_with(account)
+    sheets.replace_positions.assert_called_once_with([], [account])
+
+
+def test_second_portfolio_failure_prevents_every_sheet_write(clients):
+    settings, api, sheets, _, _ = clients
+    accounts = [Account(identifier, identifier, "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_STATUS_OPEN")
+                for identifier in ("one", "two")]
+    api.get_accounts.return_value = accounts
+    api.get_portfolio.side_effect = [[position(accounts[0])], TInvestAPIError("portfolio failed")]
+    with pytest.raises(TInvestAPIError, match="portfolio failed"):
+        sync_operations(settings, date_from=FROM)
+    assert api.get_portfolio.call_count == 2
+    # Includes ensure_sheet: no first-run creation or header writes are allowed.
+    assert sheets.method_calls == []
+    api.iter_operations.assert_not_called()
+
+
+def test_positions_failure_propagates_after_operations_and_accounts_writes(clients):
+    settings, api, sheets, _, _ = clients
+    new = operation("new")
+    api.iter_operations.side_effect = [iter([new]), iter([])]
+    sheets.replace_positions.side_effect = RuntimeError("positions write failed")
+    with pytest.raises(RuntimeError, match="positions write failed"):
+        sync_operations(settings, date_from=FROM)
+    sheets.append_operations.assert_called_once_with([new])
+    sheets.replace_accounts.assert_called_once_with([A, B])
+    sheets.replace_positions.assert_called_once_with([], [A, B])

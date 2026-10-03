@@ -35,6 +35,16 @@ def sync_operations(
 ) -> SyncResult:
     client = TInvestClient(settings.tinvest_token, verify_ssl=settings.verify_ssl)
     sheets = SheetsClient(settings.spreadsheet_id, settings.service_account_file)
+
+    # Fetch every eligible portfolio before ensure_sheet, which may write headers.
+    # Operations and account snapshots still include every returned account status.
+    accounts = client.get_accounts()
+    positions = []
+    for account in accounts:
+        if account.status == "ACCOUNT_STATUS_OPEN" and account.type in (
+            "ACCOUNT_TYPE_TINKOFF", "ACCOUNT_TYPE_TINKOFF_IIS",
+        ):
+            positions.extend(client.get_portfolio(account))
     sheets.ensure_sheet()
 
     last_dates: dict[str, datetime] = {}
@@ -44,7 +54,6 @@ def sync_operations(
         date_from = parse_from_date(settings.default_from_date)
 
     existing_ids = sheets.get_existing_operation_ids()
-    accounts = client.get_accounts()
 
     fetched = 0
     skipped = 0
@@ -64,6 +73,7 @@ def sync_operations(
 
     appended = sheets.append_operations(new_operations)
     sheets.replace_accounts(accounts)
+    sheets.replace_positions(positions, accounts)
 
     return SyncResult(
         accounts=len(accounts),

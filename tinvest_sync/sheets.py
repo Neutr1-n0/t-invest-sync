@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from tinvest_sync.api import Account, Operation
-from tinvest_sync.config import ACCOUNTS_HEADERS_ROW, ACCOUNTS_SHEET_NAME, HEADERS_ROW, SHEET_NAME
+from tinvest_sync.api import Account, Operation, Position
+from tinvest_sync.config import (
+    ACCOUNTS_HEADERS_ROW, ACCOUNTS_SHEET_NAME, HEADERS_ROW, SHEET_NAME,
+    POSITIONS_HEADERS_ROW, POSITIONS_SHEET_NAME,
+)
 
 # Эпоха Google Sheets / Excel serial date (Lotus 1-2-3 наследие): 1899-12-30.
 _SHEETS_EPOCH = datetime(1899, 12, 30)
@@ -158,6 +162,66 @@ class SheetsClient:
             spreadsheetId=self._spreadsheet_id, body={"requests": requests},
         ).execute()
 
+    def replace_positions(
+        self, positions: Iterable[Position], accounts: Iterable[Account],
+    ) -> None:
+        """Replace actual positions; Decimal values remain exact text in Sheets."""
+        updated_at = datetime.now(timezone.utc).isoformat()
+        account_names = {account.id: account.name for account in accounts}
+        rows = [POSITIONS_HEADERS_ROW] + [
+            [updated_at, position.account_id, account_names.get(position.account_id, ""),
+             position.instrument_uid or "", position.figi or "", position.ticker or "",
+             position.instrument_type or "",
+             _decimal_text(position.quantity), _decimal_text(position.quantity_lots),
+             position.currency or "", _decimal_text(position.current_price),
+             _decimal_text(position.average_position_price), _decimal_text(position.expected_yield)]
+            for position in sorted(positions, key=lambda position: (
+                position.account_id, position.ticker or "",
+                position.instrument_uid or "", position.figi or "",
+            ))
+        ]
+        spreadsheet = self._service.get(spreadsheetId=self._spreadsheet_id).execute()
+        properties = next(
+            (sheet["properties"] for sheet in spreadsheet["sheets"]
+             if sheet["properties"]["title"] == POSITIONS_SHEET_NAME),
+            None,
+        )
+        if properties is None:
+            result = self._service.batchUpdate(
+                spreadsheetId=self._spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {
+                    "title": POSITIONS_SHEET_NAME,
+                    "gridProperties": {
+                        "rowCount": max(1000, len(rows)),
+                        "columnCount": len(POSITIONS_HEADERS_ROW),
+                    },
+                }}}]},
+            ).execute()
+            properties = result["replies"][0]["addSheet"]["properties"]
+
+        sheet_id = properties["sheetId"]
+        grid = properties["gridProperties"]
+        requests = []
+        for dimension, current, required in (
+            ("ROWS", grid["rowCount"], len(rows)),
+            ("COLUMNS", grid["columnCount"], len(POSITIONS_HEADERS_ROW)),
+        ):
+            if current < required:
+                requests.append({"appendDimension": {
+                    "sheetId": sheet_id, "dimension": dimension, "length": required - current,
+                }})
+        # No endRowIndex: updateCells clears the old tail in these columns.
+        requests.append({"updateCells": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0,
+                      "startColumnIndex": 0, "endColumnIndex": len(POSITIONS_HEADERS_ROW)},
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": value}}
+                                  for value in row]} for row in rows],
+            "fields": "userEnteredValue",
+        }})
+        self._service.batchUpdate(
+            spreadsheetId=self._spreadsheet_id, body={"requests": requests},
+        ).execute()
+
     def _get_values(
         self, range_name: str, value_render_option: str = "FORMATTED_VALUE"
     ) -> list[list[object]]:
@@ -171,6 +235,10 @@ class SheetsClient:
             .execute()
         )
         return result.get("values", [])
+
+
+def _decimal_text(value: Decimal | None) -> str:
+    return "" if value is None else format(value, "f")
 
 
 def _normalize_sheet_date(value: object) -> str | None:
