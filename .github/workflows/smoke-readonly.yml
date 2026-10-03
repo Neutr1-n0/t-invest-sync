@@ -45,7 +45,14 @@ jobs:
           python -u - <<'PY'
           import json
           import os
+          import re
+          import ssl
           import sys
+          from pathlib import Path
+
+          import certifi
+          import requests
+          import urllib3
 
           from google.oauth2.service_account import Credentials
           from googleapiclient.discovery import build
@@ -62,6 +69,28 @@ jobs:
               # Prefix prevents API-provided text from becoming a runner command.
               print(f"{label}: {text}")
 
+          def sanitized_reason(exc):
+              reason = str(exc)
+              for secret in sorted(set(redactions), key=len, reverse=True):
+                  if secret:
+                      reason = reason.replace(secret, "[redacted]")
+              reason = re.sub(r"(?im)authorization[^\r\n]*", "[redacted header]", reason)
+              reason = re.sub(r"(?i)bearer\s+\S+", "[redacted credential]", reason)
+              reason = re.sub(
+                  r"(?i)(account[_-]?id[\"']?\s*[:=]\s*[\"']?)[^\s,\"'&})]+",
+                  r"\1[redacted]", reason,
+              )
+              # Also cover numeric account IDs before GetAccounts returns any IDs.
+              return re.sub(r"\b\d{6,}\b", "[redacted number]", reason)
+
+          def emit_exception(label, exc):
+              emit(label, {
+                  "type": type(exc).__name__,
+                  "cause_type": type(exc.__cause__).__name__ if exc.__cause__ else None,
+                  "context_type": type(exc.__context__).__name__ if exc.__context__ else None,
+                  "reason": sanitized_reason(exc),
+              })
+
           try:
               token = os.environ["TINVEST_TOKEN"].strip()
               spreadsheet_id = os.environ["GOOGLE_SPREADSHEET_ID"].strip()
@@ -71,6 +100,32 @@ jobs:
 
               stage = "GetAccounts"
               client = TInvestClient(token)
+              emit("tls", {
+                  "requests_version": requests.__version__,
+                  "urllib3_version": urllib3.__version__,
+                  "certifi_version": certifi.__version__,
+                  "certifi_path": certifi.where(),
+                  "openssl_version": ssl.OPENSSL_VERSION,
+                  "session_verify": client._session.verify,
+                  "repo_ca_bundle_exists": Path("ca_bundle.pem").is_file(),
+              })
+
+              # A separate Session has no T-Invest token or default auth headers.
+              # Disable ambient netrc authentication as well.
+              class NoAuth(requests.auth.AuthBase):
+                  def __call__(self, request):
+                      request.headers.pop("Authorization", None)
+                      return request
+
+              try:
+                  with requests.get(
+                      "https://invest-public-api.tbank.ru/",
+                      timeout=15, auth=NoAuth(), allow_redirects=False,
+                  ) as probe:
+                      emit("https_probe", {"success": True, "status_code": probe.status_code})
+              except requests.exceptions.RequestException as exc:
+                  emit_exception("https_probe_failed", exc)
+
               accounts = client.get_accounts()
               redactions.extend(account.id for account in accounts)
               emit("accounts_count", len(accounts))
@@ -120,6 +175,10 @@ jobs:
                   sheet["properties"]["title"]
                   for sheet in spreadsheet.get("sheets", [])
               ])
+          except requests.exceptions.SSLError as exc:
+              emit_exception("tls_failure", exc)
+              print(f"Smoke FAILED at {stage}: {type(exc).__name__}", file=sys.stderr)
+              sys.exit(1)
           except Exception as exc:
               # Exception bodies and tracebacks may contain IDs or API responses.
               print(f"Smoke FAILED at {stage}: {type(exc).__name__}", file=sys.stderr)
