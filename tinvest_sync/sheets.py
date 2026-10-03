@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from tinvest_sync.api import Operation
-from tinvest_sync.config import HEADERS_ROW, SHEET_NAME
+from tinvest_sync.api import Account, Operation, Position
+from tinvest_sync.config import (
+    ACCOUNTS_HEADERS_ROW, ACCOUNTS_SHEET_NAME, HEADERS_ROW, SHEET_NAME,
+    POSITIONS_HEADERS_ROW, POSITIONS_SHEET_NAME,
+)
 
 # Эпоха Google Sheets / Excel serial date (Lotus 1-2-3 наследие): 1899-12-30.
 _SHEETS_EPOCH = datetime(1899, 12, 30)
@@ -60,20 +64,41 @@ class SheetsClient:
 
         return {row[0] for row in values[1:] if row and row[0]}
 
-    def get_last_operation_date(self) -> str | None:
+    def get_last_operation_dates_by_account(self) -> dict[str, datetime]:
+        """Read per-account maxima in UTC, ignoring incomplete or invalid rows."""
         values = self._get_values(
-            f"{SHEET_NAME}!A:A", value_render_option="UNFORMATTED_VALUE"
+            f"{SHEET_NAME}!A:C", value_render_option="UNFORMATTED_VALUE"
         )
-        if len(values) <= 1:
-            return None
-
-        dates = [
-            _normalize_sheet_date(row[0])
-            for row in values[1:]
-            if row and row[0] not in (None, "")
-        ]
-        dates = [d for d in dates if d]
-        return max(dates) if dates else None
+        dates: dict[str, datetime] = {}
+        for row in values[1:]:
+            if len(row) < 3:
+                continue
+            raw_account_id = row[2]
+            if isinstance(raw_account_id, str):
+                account_id = raw_account_id.strip()
+            elif isinstance(raw_account_id, int) and not isinstance(raw_account_id, bool):
+                account_id = str(raw_account_id)
+            elif isinstance(raw_account_id, float) and raw_account_id.is_integer():
+                account_id = str(int(raw_account_id))
+            else:
+                continue
+            if not account_id:
+                continue
+            if isinstance(row[0], bool):
+                continue
+            try:
+                text = _normalize_sheet_date(row[0])
+                if not text:
+                    continue
+                date = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                date = date.astimezone(timezone.utc)
+            except (ValueError, OverflowError):
+                continue
+            if account_id not in dates or date > dates[account_id]:
+                dates[account_id] = date
+        return dates
 
     def append_operations(self, operations: Iterable[Operation]) -> int:
         rows = [_operation_to_row(operation) for operation in operations]
@@ -89,9 +114,117 @@ class SheetsClient:
         ).execute()
         return len(rows)
 
+    def replace_accounts(self, accounts: Iterable[Account]) -> None:
+        """Replace the account snapshot, including headers and stale data rows."""
+        updated_at = datetime.now(timezone.utc).isoformat()
+        rows = [ACCOUNTS_HEADERS_ROW] + [
+            [updated_at, account.id, account.name, account.type,
+             account.status or "", account.opened_date or "",
+             account.closed_date or "", account.access_level or ""]
+            for account in sorted(accounts, key=lambda account: account.id)
+        ]
+        spreadsheet = self._service.get(spreadsheetId=self._spreadsheet_id).execute()
+        properties = next(
+            (sheet["properties"] for sheet in spreadsheet["sheets"]
+             if sheet["properties"]["title"] == ACCOUNTS_SHEET_NAME),
+            None,
+        )
+        if properties is None:
+            result = self._service.batchUpdate(
+                spreadsheetId=self._spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {
+                    "title": ACCOUNTS_SHEET_NAME,
+                    "gridProperties": {"rowCount": max(1000, len(rows)), "columnCount": 8},
+                }}}]},
+            ).execute()
+            properties = result["replies"][0]["addSheet"]["properties"]
+
+        sheet_id = properties["sheetId"]
+        grid = properties["gridProperties"]
+        requests = []
+        for dimension, current, required in (
+            ("ROWS", grid["rowCount"], len(rows)),
+            ("COLUMNS", grid["columnCount"], len(ACCOUNTS_HEADERS_ROW)),
+        ):
+            if current < required:
+                requests.append({"appendDimension": {
+                    "sheetId": sheet_id, "dimension": dimension, "length": required - current,
+                }})
+        # A range without endRowIndex also clears values below the new snapshot.
+        requests.append({"updateCells": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0,
+                      "startColumnIndex": 0, "endColumnIndex": len(ACCOUNTS_HEADERS_ROW)},
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": value}}
+                                  for value in row]} for row in rows],
+            "fields": "userEnteredValue",
+        }})
+        self._service.batchUpdate(
+            spreadsheetId=self._spreadsheet_id, body={"requests": requests},
+        ).execute()
+
+    def replace_positions(
+        self, positions: Iterable[Position], accounts: Iterable[Account],
+    ) -> None:
+        """Replace actual positions; Decimal values remain exact text in Sheets."""
+        updated_at = datetime.now(timezone.utc).isoformat()
+        account_names = {account.id: account.name for account in accounts}
+        rows = [POSITIONS_HEADERS_ROW] + [
+            [updated_at, position.account_id, account_names.get(position.account_id, ""),
+             position.instrument_uid or "", position.figi or "", position.ticker or "",
+             position.instrument_type or "",
+             _decimal_text(position.quantity), _decimal_text(position.quantity_lots),
+             position.currency or "", _decimal_text(position.current_price),
+             _decimal_text(position.average_position_price), _decimal_text(position.expected_yield)]
+            for position in sorted(positions, key=lambda position: (
+                position.account_id, position.ticker or "",
+                position.instrument_uid or "", position.figi or "",
+            ))
+        ]
+        spreadsheet = self._service.get(spreadsheetId=self._spreadsheet_id).execute()
+        properties = next(
+            (sheet["properties"] for sheet in spreadsheet["sheets"]
+             if sheet["properties"]["title"] == POSITIONS_SHEET_NAME),
+            None,
+        )
+        if properties is None:
+            result = self._service.batchUpdate(
+                spreadsheetId=self._spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {
+                    "title": POSITIONS_SHEET_NAME,
+                    "gridProperties": {
+                        "rowCount": max(1000, len(rows)),
+                        "columnCount": len(POSITIONS_HEADERS_ROW),
+                    },
+                }}}]},
+            ).execute()
+            properties = result["replies"][0]["addSheet"]["properties"]
+
+        sheet_id = properties["sheetId"]
+        grid = properties["gridProperties"]
+        requests = []
+        for dimension, current, required in (
+            ("ROWS", grid["rowCount"], len(rows)),
+            ("COLUMNS", grid["columnCount"], len(POSITIONS_HEADERS_ROW)),
+        ):
+            if current < required:
+                requests.append({"appendDimension": {
+                    "sheetId": sheet_id, "dimension": dimension, "length": required - current,
+                }})
+        # No endRowIndex: updateCells clears the old tail in these columns.
+        requests.append({"updateCells": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0,
+                      "startColumnIndex": 0, "endColumnIndex": len(POSITIONS_HEADERS_ROW)},
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": value}}
+                                  for value in row]} for row in rows],
+            "fields": "userEnteredValue",
+        }})
+        self._service.batchUpdate(
+            spreadsheetId=self._spreadsheet_id, body={"requests": requests},
+        ).execute()
+
     def _get_values(
         self, range_name: str, value_render_option: str = "FORMATTED_VALUE"
-    ) -> list[list[str]]:
+    ) -> list[list[object]]:
         result = (
             self._service.values()
             .get(
@@ -102,6 +235,10 @@ class SheetsClient:
             .execute()
         )
         return result.get("values", [])
+
+
+def _decimal_text(value: Decimal | None) -> str:
+    return "" if value is None else format(value, "f")
 
 
 def _normalize_sheet_date(value: object) -> str | None:
